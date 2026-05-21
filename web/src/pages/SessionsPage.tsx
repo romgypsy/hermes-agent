@@ -424,6 +424,8 @@ export default function SessionsPage() {
   const logScrollRef = useRef<HTMLPreElement | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [overviewSessions, setOverviewSessions] = useState<SessionInfo[]>([]);
+  const overviewStatusInFlight = useRef(false);
+  const overviewSessionsInFlight = useRef(false);
   const { toast, showToast } = useToast();
   const { t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
@@ -500,17 +502,29 @@ export default function SessionsPage() {
 
   useEffect(() => {
     const loadOverview = () => {
-      api
-        .getStatus()
-        .then(setStatus)
-        .catch(() => {});
-      api
-        .getSessions(50)
-        .then((r) => setOverviewSessions(r.sessions))
-        .catch(() => {});
+      if (!overviewStatusInFlight.current) {
+        overviewStatusInFlight.current = true;
+        api
+          .getStatus()
+          .then(setStatus)
+          .catch(() => {})
+          .finally(() => {
+            overviewStatusInFlight.current = false;
+          });
+      }
+      if (!overviewSessionsInFlight.current) {
+        overviewSessionsInFlight.current = true;
+        api
+          .getSessions(50)
+          .then((r) => setOverviewSessions(r.sessions))
+          .catch(() => {})
+          .finally(() => {
+            overviewSessionsInFlight.current = false;
+          });
+      }
     };
     loadOverview();
-    const id = setInterval(loadOverview, 5000);
+    const id = setInterval(loadOverview, 15000);
     return () => clearInterval(id);
   }, []);
 

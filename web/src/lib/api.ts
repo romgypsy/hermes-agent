@@ -16,6 +16,10 @@ function readBasePath(): string {
 
 export const HERMES_BASE_PATH = readBasePath();
 const BASE = HERMES_BASE_PATH;
+const API_FETCH_TIMEOUT_MS = 30000;
+const API_FETCH_RETRY_TIMEOUT_MS = 12000;
+const MAX_CONCURRENT_GET_API_FETCHES = 2;
+const STALE_SESSION_RELOAD_KEY = "hermes-dashboard-stale-session-reload";
 
 import type { DashboardTheme } from "@/themes/types";
 
@@ -29,6 +33,27 @@ declare global {
 }
 let _sessionToken: string | null = null;
 const SESSION_HEADER = "X-Hermes-Session-Token";
+const inFlightGetRequests = new Map<string, Promise<unknown>>();
+const getQueue: Array<() => void> = [];
+let activeGetRequests = 0;
+
+function runWithGetSlot<T>(fn: () => Promise<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const run = () => {
+      activeGetRequests += 1;
+      fn().then(resolve, reject).finally(() => {
+        activeGetRequests = Math.max(0, activeGetRequests - 1);
+        const next = getQueue.shift();
+        if (next) next();
+      });
+    };
+    if (activeGetRequests < MAX_CONCURRENT_GET_API_FETCHES) {
+      run();
+    } else {
+      getQueue.push(run);
+    }
+  });
+}
 
 function setSessionHeader(headers: Headers, token: string): void {
   if (!headers.has(SESSION_HEADER)) {
@@ -36,19 +61,109 @@ function setSessionHeader(headers: Headers, token: string): void {
   }
 }
 
+function withRetryParam(url: string, attempt: number): string {
+  if (attempt === 0) return url;
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}_hermes_retry=${Date.now()}_${attempt}`;
+}
+
+function isAbortLikeError(err: unknown): boolean {
+  if (err instanceof DOMException && (err.name === "AbortError" || err.name === "TimeoutError")) {
+    return true;
+  }
+  return err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError");
+}
+
+async function fetchWithTimeout(input: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => {
+    controller.abort(new DOMException("Dashboard API request timed out", "TimeoutError"));
+  }, timeoutMs);
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: init.signal ?? controller.signal,
+    });
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
 export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? "GET").toUpperCase();
+  const canRetry = method === "GET" && !init?.signal;
+  const cacheKey = `${method} ${url}`;
+
+  if (canRetry) {
+    const existing = inFlightGetRequests.get(cacheKey);
+    if (existing) {
+      return existing as Promise<T>;
+    }
+    const queued = runWithGetSlot(() => fetchJSONCore<T>(url, init)).finally(() => {
+      inFlightGetRequests.delete(cacheKey);
+    });
+    inFlightGetRequests.set(cacheKey, queued);
+    return queued;
+  }
+
+  return fetchJSONCore<T>(url, init);
+}
+
+async function fetchJSONCore<T>(url: string, init?: RequestInit): Promise<T> {
   // Inject the session token into all /api/ requests.
   const headers = new Headers(init?.headers);
   const token = window.__HERMES_SESSION_TOKEN__;
   if (token) {
     setSessionHeader(headers, token);
   }
-  const res = await fetch(`${BASE}${url}`, { ...init, headers });
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(`${res.status}: ${text}`);
+
+  // Behind Cloudflare Access, the origin can complete quickly while a browser
+  // connection remains pending. For safe GETs, retry once on a stuck client-side
+  // fetch using a cache-busted URL before surfacing an error.
+  const method = (init?.method ?? "GET").toUpperCase();
+  const canRetry = method === "GET" && !init?.signal;
+  const maxAttempts = canRetry ? 2 : 1;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      const timeoutMs = attempt === 0 && canRetry ? API_FETCH_RETRY_TIMEOUT_MS : API_FETCH_TIMEOUT_MS;
+      const requestUrl = `${BASE}${withRetryParam(url, attempt)}`;
+      const res = await fetchWithTimeout(requestUrl, {
+        ...init,
+        headers,
+        cache: "no-store",
+      }, timeoutMs);
+      if (!res.ok) {
+        const text = await res.text().catch(() => res.statusText);
+        if (res.status === 401 && text.includes("Unauthorized")) {
+          // The dashboard token is intentionally ephemeral and changes whenever
+          // hermes-dashboard restarts. Old tabs can keep polling with the stale
+          // token and then every protected API returns {detail:"Unauthorized"}.
+          // Reload once so the HTML can inject a fresh token; avoid a reload loop.
+          const alreadyReloaded = window.sessionStorage.getItem(STALE_SESSION_RELOAD_KEY) === "1";
+          if (!alreadyReloaded) {
+            window.sessionStorage.setItem(STALE_SESSION_RELOAD_KEY, "1");
+            window.location.reload();
+            throw new Error("Dashboard session refreshed after server restart; reloading…");
+          }
+          throw new Error("Dashboard session expired. Close this tab and open the dashboard again to get a fresh session.");
+        }
+        window.sessionStorage.removeItem(STALE_SESSION_RELOAD_KEY);
+        throw new Error(`${res.status}: ${text}`);
+      }
+      window.sessionStorage.removeItem(STALE_SESSION_RELOAD_KEY);
+      return res.json();
+    } catch (err) {
+      if (isAbortLikeError(err) && attempt + 1 < maxAttempts) {
+        continue;
+      }
+      if (isAbortLikeError(err)) {
+        throw new Error("Dashboard API request timed out after retrying. The origin may have responded, but the browser did not receive the API response through the proxy path. Refresh the dashboard; if it persists, check this API path in Network.");
+      }
+      throw err;
+    }
   }
-  return res.json();
+  throw new Error("Dashboard API request failed unexpectedly.");
 }
 
 async function getSessionToken(): Promise<string> {
