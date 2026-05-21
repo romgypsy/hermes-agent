@@ -112,6 +112,7 @@ class Platform(Enum):
     SLACK = "slack"
     SIGNAL = "signal"
     MATTERMOST = "mattermost"
+    LINE = "line"
     MATRIX = "matrix"
     HOMEASSISTANT = "homeassistant"
     EMAIL = "email"

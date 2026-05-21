@@ -16,6 +16,10 @@ function readBasePath(): string {
 
 export const HERMES_BASE_PATH = readBasePath();
 const BASE = HERMES_BASE_PATH;
+const API_FETCH_TIMEOUT_MS = 30000;
+const API_FETCH_RETRY_TIMEOUT_MS = 12000;
+const MAX_CONCURRENT_GET_API_FETCHES = 2;
+const STALE_SESSION_RELOAD_KEY = "hermes-dashboard-stale-session-reload";
 
 import type { DashboardTheme } from "@/themes/types";
 
@@ -34,6 +38,27 @@ declare global {
 }
 let _sessionToken: string | null = null;
 const SESSION_HEADER = "X-Hermes-Session-Token";
+const inFlightGetRequests = new Map<string, Promise<unknown>>();
+const getQueue: Array<() => void> = [];
+let activeGetRequests = 0;
+
+function runWithGetSlot<T>(fn: () => Promise<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const run = () => {
+      activeGetRequests += 1;
+      fn().then(resolve, reject).finally(() => {
+        activeGetRequests = Math.max(0, activeGetRequests - 1);
+        const next = getQueue.shift();
+        if (next) next();
+      });
+    };
+    if (activeGetRequests < MAX_CONCURRENT_GET_API_FETCHES) {
+      run();
+    } else {
+      getQueue.push(run);
+    }
+  });
+}
 
 function setSessionHeader(headers: Headers, token: string): void {
   if (!headers.has(SESSION_HEADER)) {
@@ -41,7 +66,59 @@ function setSessionHeader(headers: Headers, token: string): void {
   }
 }
 
+function withRetryParam(url: string, attempt: number): string {
+  if (attempt === 0) return url;
+  const separator = url.includes("?") ? "&" : "?";
+  return `${url}${separator}_hermes_retry=${Date.now()}_${attempt}`;
+}
+
+function isAbortLikeError(err: unknown): boolean {
+  if (err instanceof DOMException && (err.name === "AbortError" || err.name === "TimeoutError")) {
+    return true;
+  }
+  return err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError");
+}
+
+async function fetchWithTimeout(input: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => {
+    controller.abort(new DOMException("Dashboard API request timed out", "TimeoutError"));
+  }, timeoutMs);
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: init.signal ?? controller.signal,
+    });
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
 export async function fetchJSON<T>(
+  url: string,
+  init?: RequestInit,
+  options?: FetchJSONOptions,
+): Promise<T> {
+  const method = (init?.method ?? "GET").toUpperCase();
+  const canRetry = method === "GET" && !init?.signal;
+  const cacheKey = `${method} ${url}`;
+
+  if (canRetry) {
+    const existing = inFlightGetRequests.get(cacheKey);
+    if (existing) {
+      return existing as Promise<T>;
+    }
+    const queued = runWithGetSlot(() => fetchJSONCore<T>(url, init, options)).finally(() => {
+      inFlightGetRequests.delete(cacheKey);
+    });
+    inFlightGetRequests.set(cacheKey, queued);
+    return queued;
+  }
+
+  return fetchJSONCore<T>(url, init, options);
+}
+
+async function fetchJSONCore<T>(
   url: string,
   init?: RequestInit,
   options?: FetchJSONOptions,
@@ -52,92 +129,99 @@ export async function fetchJSON<T>(
   if (token) {
     setSessionHeader(headers, token);
   }
-  const res = await fetch(`${BASE}${url}`, {
-    ...init,
-    headers,
-    // ``credentials: 'include'`` so the cookie-auth path (gated mode) works
-    // for any fetch routed through here. Loopback mode is unaffected — the
-    // server doesn't read cookies and the legacy session-token header is
-    // already attached above.
-    credentials: init?.credentials ?? "include",
-  });
-  if (res.status === 401) {
-    // Phase 6: the gated middleware emits a structured envelope so the
-    // SPA can full-page-navigate to /login on session expiry. Parse it,
-    // and only redirect on the known error codes — domain-level 401s
-    // (e.g. "you don't have permission to read this monitor") bubble
-    // up as regular errors so callers can handle them.
-    let body: { error?: string; login_url?: string } = {};
+
+  // Behind Cloudflare Access, the origin can complete quickly while a browser
+  // connection remains pending. For safe GETs, retry once on a stuck client-side
+  // fetch using a cache-busted URL before surfacing an error.
+  const method = (init?.method ?? "GET").toUpperCase();
+  const canRetry = method === "GET" && !init?.signal;
+  const maxAttempts = canRetry ? 2 : 1;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
-      body = await res.clone().json();
-    } catch {
-      /* non-JSON 401 — let it fall through */
-    }
-    if (
-      (body.error === "unauthenticated" || body.error === "session_expired") &&
-      body.login_url
-    ) {
-      // Preserve where the user was so /auth/callback can land them back
-      // after re-auth. The gate's login_url already carries a ``next=``
-      // built from the request path, but the SPA may be deep inside a
-      // SPA route the gate never saw — e.g. a hash route or a client-side
-      // /sessions/<id> deep link. Save the current location as a
-      // fallback the post-login handler can read.
+      const timeoutMs = attempt === 0 && canRetry ? API_FETCH_RETRY_TIMEOUT_MS : API_FETCH_TIMEOUT_MS;
+      const requestUrl = `${BASE}${withRetryParam(url, attempt)}`;
+      const res = await fetchWithTimeout(requestUrl, {
+        ...init,
+        headers,
+        cache: "no-store",
+        // ``credentials: 'include'`` so the cookie-auth path (gated mode) works
+        // for any fetch routed through here. Loopback mode is unaffected — the
+        // server doesn't read cookies and the legacy session-token header is
+        // already attached above.
+        credentials: init?.credentials ?? "include",
+      }, timeoutMs);
+
+      if (res.status === 401) {
+        // Phase 6: the gated middleware emits a structured envelope so the
+        // SPA can full-page-navigate to /login on session expiry. Parse it,
+        // and only redirect on the known error codes — domain-level 401s
+        // bubble up as regular errors so callers can handle them.
+        let body: { error?: string; login_url?: string } = {};
+        try {
+          body = await res.clone().json();
+        } catch {
+          /* non-JSON 401 — let it fall through */
+        }
+        if (
+          (body.error === "unauthenticated" || body.error === "session_expired") &&
+          body.login_url
+        ) {
+          try {
+            sessionStorage.setItem(
+              "hermes.lastLocation",
+              window.location.pathname + window.location.search,
+            );
+          } catch {
+            /* SSR / privacy mode — ignore */
+          }
+          window.location.assign(body.login_url);
+          return new Promise<T>(() => {});
+        }
+        // Loopback mode: ``_SESSION_TOKEN`` rotates on every server restart.
+        // A reload picks up the freshly-injected token. Do this only once,
+        // and allow callers such as /api/auth/me to opt out.
+        if (!window.__HERMES_AUTH_REQUIRED__ && !options?.allowUnauthorized) {
+          let alreadyReloaded = false;
+          try {
+            alreadyReloaded = sessionStorage.getItem(STALE_SESSION_RELOAD_KEY) === "1";
+          } catch {
+            /* SSR / privacy mode — fall through to throw */
+          }
+          if (!alreadyReloaded) {
+            try {
+              sessionStorage.setItem(STALE_SESSION_RELOAD_KEY, "1");
+            } catch {
+              /* SSR / privacy mode — best effort */
+            }
+            window.location.reload();
+            return new Promise<T>(() => {});
+          }
+        }
+      }
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => res.statusText);
+        throw new Error(`${res.status}: ${text}`);
+      }
+
       try {
-        sessionStorage.setItem(
-          "hermes.lastLocation",
-          window.location.pathname + window.location.search,
-        );
+        sessionStorage.removeItem(STALE_SESSION_RELOAD_KEY);
       } catch {
         /* SSR / privacy mode — ignore */
       }
-      window.location.assign(body.login_url);
-      // Never resolve — the page is about to unload.
-      return new Promise<T>(() => {});
-    }
-    // Loopback mode: ``_SESSION_TOKEN`` rotates on every server restart
-    // (``hermes update``, ``hermes gateway restart``, etc.). A tab kept
-    // open across the restart holds the OLD token in
-    // ``window.__HERMES_SESSION_TOKEN__`` from the previous HTML render,
-    // so every fetch returns 401. The HTML is served ``Cache-Control:
-    // no-store`` so a reload picks up the freshly-injected token. Trigger
-    // that reload once on the first stale-token 401 — gated mode is
-    // handled above, so reaching here in gated mode means a real
-    // middleware failure that should not reload-loop.
-    if (!window.__HERMES_AUTH_REQUIRED__ && !options?.allowUnauthorized) {
-      let alreadyReloaded = false;
-      try {
-        alreadyReloaded =
-          sessionStorage.getItem("hermes.tokenReloadAttempted") === "1";
-      } catch {
-        /* SSR / privacy mode — fall through to throw */
+      return res.json();
+    } catch (err) {
+      if (isAbortLikeError(err) && attempt + 1 < maxAttempts) {
+        continue;
       }
-      if (!alreadyReloaded) {
-        try {
-          sessionStorage.setItem("hermes.tokenReloadAttempted", "1");
-        } catch {
-          /* SSR / privacy mode — best effort */
-        }
-        window.location.reload();
-        return new Promise<T>(() => {});
+      if (isAbortLikeError(err)) {
+        throw new Error("Dashboard API request timed out after retrying. The origin may have responded, but the browser did not receive the API response through the proxy path. Refresh the dashboard; if it persists, check this API path in Network.");
       }
+      throw err;
     }
   }
-  if (res.ok) {
-    // Clear the stale-token reload guard: a successful 2xx proves the
-    // current ``window.__HERMES_SESSION_TOKEN__`` is valid, so the next
-    // 401 — if any — should be allowed to trigger its own reload cycle.
-    try {
-      sessionStorage.removeItem("hermes.tokenReloadAttempted");
-    } catch {
-      /* SSR / privacy mode — ignore */
-    }
-  }
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(`${res.status}: ${text}`);
-  }
-  return res.json();
+  throw new Error("Dashboard API request failed unexpectedly.");
 }
 
 /** Encode a plugin registry key for URL paths (preserves `/` segment separators). */

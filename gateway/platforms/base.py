@@ -4103,6 +4103,29 @@ class BasePlatformAdapter(ABC):
                         await _post_result
                 except Exception:
                     pass
+
+            # Delete temporary inbound media downloaded by webhook adapters
+            # after the response is delivered (LINE image downloads, etc.).
+            try:
+                _metadata = getattr(event, "metadata", None) or {}
+                _tmp_paths = []
+                if isinstance(_metadata, dict):
+                    for _key in ("temp_media_paths", "line_temp_media_paths"):
+                        _value = _metadata.get(_key)
+                        if isinstance(_value, (list, tuple, set)):
+                            _tmp_paths.extend(str(p) for p in _value if p)
+                        elif isinstance(_value, str) and _value:
+                            _tmp_paths.append(_value)
+                for _path in dict.fromkeys(_tmp_paths):
+                    try:
+                        _p = Path(_path)
+                        if _p.exists() and _p.is_file():
+                            _p.unlink()
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+
             # Stop typing indicator
             await _stop_typing_task()
             # Also cancel any platform-level persistent typing tasks (e.g. Discord)

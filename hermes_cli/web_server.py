@@ -829,12 +829,25 @@ async def get_sessions(limit: int = 20, offset: int = 0):
             sessions = db.list_sessions_rich(limit=limit, offset=offset)
             total = db.session_count()
             now = time.time()
+            # The dashboard list view only uses the compact SessionInfo fields
+            # declared in web/src/lib/api.ts.  list_sessions_rich() also returns
+            # large internal columns such as system_prompt; with 50 sessions this
+            # can exceed 500KB and has caused Cloudflare-origin responses to stay
+            # pending behind Access.  Keep detailed data on the per-session
+            # endpoints and return a slim list payload here.
+            public_keys = {
+                "id", "source", "model", "title", "started_at", "ended_at",
+                "last_active", "message_count", "tool_call_count",
+                "input_tokens", "output_tokens", "preview", "is_active",
+            }
+            slim_sessions = []
             for s in sessions:
                 s["is_active"] = (
                     s.get("ended_at") is None
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
-            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
+                slim_sessions.append({k: s.get(k) for k in public_keys})
+            return {"sessions": slim_sessions, "total": total, "limit": limit, "offset": offset}
         finally:
             db.close()
     except Exception:

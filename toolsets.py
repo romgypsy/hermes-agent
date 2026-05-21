@@ -418,6 +418,12 @@ TOOLSETS = {
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
+
+    "hermes-line": {
+        "description": "LINE bot owner/admin toolset - full access; non-owner LINE users are reduced at runtime",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
     
     "hermes-discord": {
         "description": "Discord bot toolset - full access (terminal has safety checks via dangerous command approval)",

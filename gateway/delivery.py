@@ -9,6 +9,7 @@ Routes messages to the appropriate destination based on:
 """
 
 import logging
+import re
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
@@ -339,6 +340,49 @@ class DeliveryRouter:
                 send_metadata["telegram_dm_topic_reply_fallback"] = True
             elif "thread_id" not in send_metadata and "message_thread_id" not in send_metadata and not has_explicit_direct_topic:
                 send_metadata["thread_id"] = target_thread_id
+
+        # LINE cron/report output can include internal native-image markers.
+        # Send those URLs as LINE image bubbles and strip the marker/URL from
+        # the user-facing text so users do not see raw chart links.
+        if target.platform == Platform.LINE and hasattr(adapter, "send_image"):
+            image_urls: List[str] = []
+            text_lines: List[str] = []
+            marker_re = re.compile(r"^\s*LINE_IMAGE_URL:\s*(https://\S+)\s*$", re.IGNORECASE)
+            for line in str(content or "").splitlines():
+                match = marker_re.match(line)
+                if match:
+                    image_urls.append(match.group(1).strip())
+                else:
+                    text_lines.append(line)
+            cleaned = "\n".join(text_lines).strip()
+            text_result = None
+            if cleaned:
+                text_result = await adapter.send(target.chat_id, cleaned, metadata=send_metadata or None)
+                if _send_result_failed(text_result):
+                    raise RuntimeError(_send_result_error(text_result) or "LINE text delivery failed")
+            image_results = []
+            for image_url in image_urls:
+                img_result = await adapter.send_image(
+                    target.chat_id,
+                    image_url,
+                    caption=None,
+                    metadata={**send_metadata, "line_force_push": True} if send_metadata else {"line_force_push": True},
+                )
+                image_result = {
+                    "success": bool(getattr(img_result, "success", False)),
+                    "message_id": getattr(img_result, "message_id", None),
+                    "error": getattr(img_result, "error", None),
+                    "image_url": image_url,
+                }
+                image_results.append(image_result)
+                if not image_result["success"]:
+                    raise RuntimeError(str(image_result.get("error") or "LINE image delivery failed"))
+            return {
+                "success": bool(getattr(text_result, "success", True)) and all(item["success"] for item in image_results),
+                "text": text_result,
+                "images": image_results,
+            }
+
         result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
         if _send_result_failed(result):
             if (

@@ -6354,9 +6354,19 @@ class GatewayRunner:
             )
 
         # ── Plugin-registered platforms (checked first) ───────────────────
+        # Local LINE deployments may carry site-specific behavior in
+        # gateway/platforms/line.py (Thai ack text, image/chart delivery,
+        # general-user restrictions).  Prefer that built-in adapter for LINE
+        # unless explicitly opting into the generic plugin with
+        # HERMES_USE_LINE_PLUGIN=true.
+        use_plugin_registry = True
+        if platform == Platform.LINE:
+            use_plugin_registry = os.getenv("HERMES_USE_LINE_PLUGIN", "").strip().lower() in {
+                "1", "true", "yes", "on"
+            }
         try:
             from gateway.platform_registry import platform_registry
-            if platform_registry.is_registered(platform.value):
+            if use_plugin_registry and platform_registry.is_registered(platform.value):
                 adapter = platform_registry.create_adapter(platform.value, config)
                 if adapter is not None:
                     # Adapters that need a back-reference to the gateway runner
@@ -6486,6 +6496,13 @@ class GatewayRunner:
                 logger.warning("Weixin: aiohttp/cryptography not installed")
                 return None
             return WeixinAdapter(config)
+
+        elif platform == Platform.LINE:
+            from gateway.platforms.line import LineAdapter, check_line_requirements
+            if not check_line_requirements():
+                logger.warning("LINE: line-bot-sdk not installed or LINE credentials not set")
+                return None
+            return LineAdapter(config)
 
         elif platform == Platform.MATRIX:
             from gateway.platforms.matrix import MatrixAdapter, check_matrix_requirements
@@ -6635,6 +6652,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+            Platform.LINE: "LINE_ALLOWED_USERS",
         }
         platform_group_user_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -6857,6 +6875,7 @@ class GatewayRunner:
                 Platform.WEIXIN:   "WEIXIN_ALLOWED_USERS",
                 Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
                 Platform.QQBOT:    "QQ_ALLOWED_USERS",
+                Platform.LINE:     "LINE_ALLOWED_USERS",
             }
             platform_group_env_map = {
                 Platform.TELEGRAM: (
@@ -6906,6 +6925,115 @@ class GatewayRunner:
                 )
 
         await adapter.send(source.chat_id, content, metadata=metadata)
+
+    @staticmethod
+    def _line_env_bool(name: str) -> bool:
+        return os.getenv(name, "").strip().lower() in ("true", "1", "yes", "on")
+
+    @staticmethod
+    def _line_env_ids(*names: str) -> set[str]:
+        ids: set[str] = set()
+        for name in names:
+            raw = os.getenv(name, "").strip()
+            if not raw:
+                continue
+            ids.update(item.strip() for item in raw.split(",") if item.strip())
+        return ids
+
+    def _is_line_command_authorized(self, source: SessionSource) -> bool:
+        """Return True only for LINE users allowed to use owner/admin slash commands."""
+        platform = getattr(source, "platform", None)
+        if platform != Platform.LINE:
+            return True
+        user_id = getattr(source, "user_id", None)
+        if not user_id:
+            return False
+        if self._line_env_bool("LINE_COMMAND_ALLOW_ALL_USERS"):
+            return True
+        command_ids = self._line_env_ids("LINE_COMMAND_ALLOWED_USERS")
+        if not command_ids:
+            # Backward compatible: LINE_ALLOWED_USERS are the bot owner/admins.
+            command_ids = self._line_env_ids("LINE_ALLOWED_USERS")
+        if "*" in command_ids or user_id in command_ids:
+            return True
+        return False
+
+    def _is_line_general_message_allowed(self, event: MessageEvent, source: SessionSource) -> bool:
+        """Allow non-owner LINE users to chat/upload media without admin commands."""
+        platform = getattr(source, "platform", None)
+        if platform != Platform.LINE:
+            return False
+        text = (getattr(event, "text", None) or "").strip()
+        if text.startswith("/"):
+            return False
+        return self._line_env_bool("LINE_ALLOW_GENERAL_USERS") or self._line_env_bool("LINE_ALLOW_ALL_USERS")
+
+    def _line_runtime_toolsets_for_source(self, source: SessionSource, enabled_toolsets: list[str]) -> list[str]:
+        """Restrict LINE non-owner users to safe general-chat tools only.
+
+        Owner/admin LINE users keep the normal LINE platform toolsets. General
+        LINE users may chat and analyze images, but they should not get deep
+        Hermes/system tool access such as terminal, file, cronjob, memory, or
+        cross-platform messaging.
+        """
+        if getattr(source, "platform", None) != Platform.LINE:
+            return enabled_toolsets
+        if self._is_line_command_authorized(source):
+            return enabled_toolsets
+        raw = os.getenv("LINE_GENERAL_TOOLSETS", "web,vision").strip()
+        safe = [item.strip() for item in raw.split(",") if item.strip()]
+        return safe or ["web", "vision"]
+
+    async def _send_processing_ack_if_needed(self, event: MessageEvent, source) -> bool:
+        """Send LINE's immediate processing acknowledgment without consuming reply_token.
+
+        The LINE adapter normally prefers LINE reply tokens for the final answer.
+        A short "processing" notice must therefore be sent as push, otherwise it
+        consumes LINE's one-time reply token and the real model response may fail.
+        """
+        platform = getattr(source, "platform", None)
+        platform_name = getattr(platform, "value", platform)
+        if platform_name != "line":
+            return False
+
+        message_type = getattr(event, "message_type", None)
+        message_type_value = getattr(message_type, "value", message_type)
+        if message_type_value != "text":
+            return False
+
+        text = (getattr(event, "text", None) or "").strip()
+        if not text or text.startswith("/"):
+            return False
+
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            event.metadata = metadata
+        if metadata.get("line_processing_ack_sent"):
+            return False
+
+        adapter = self.adapters.get(platform) or self.adapters.get(platform_name)
+        if not adapter or not getattr(source, "chat_id", None):
+            return False
+
+        ack_metadata = dict(metadata)
+        ack_metadata["line_force_push"] = True
+        ack_metadata["skip_reply_token"] = True
+        if getattr(source, "thread_id", None):
+            ack_metadata.setdefault("thread_id", source.thread_id)
+
+        message = "รับทราบครับ กำลังประมวลผลให้สักครู่ จะรีบแจ้งเมื่อเรียบร้อยแล้ว"
+        try:
+            await adapter.send(source.chat_id, message, metadata=ack_metadata)
+            metadata["line_processing_ack_sent"] = True
+            logger.warning(
+                "Sent LINE processing acknowledgement via push to %s",
+                source.chat_id,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Failed to send LINE processing acknowledgement: %s", exc)
+            return False
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -6979,40 +7107,61 @@ class GatewayRunner:
             if not self._is_user_authorized(source):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
-        elif not self._is_user_authorized(source):
-            logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
-            if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
-                platform_name = source.platform.value if source.platform else "unknown"
-                # Rate-limit ALL pairing responses (code or rejection) to
-                # prevent spamming the user with repeated messages when
-                # multiple DMs arrive in quick succession.
-                if self.pairing_store._is_rate_limited(platform_name, source.user_id):
-                    return None
-                code = self.pairing_store.generate_code(
-                    platform_name, source.user_id, source.user_name or ""
+        else:
+            _line_general_allowed = self._is_line_general_message_allowed(event, source)
+            _line_command_denied = (
+                source.platform == Platform.LINE
+                and (event.text or "").strip().startswith("/")
+                and not self._is_line_command_authorized(source)
+            )
+            if _line_command_denied:
+                logger.warning(
+                    "Unauthorized LINE command user: %s (%s) command=%s",
+                    source.user_id,
+                    source.user_name,
+                    event.get_command(),
                 )
-                if code:
-                    adapter = self.adapters.get(source.platform)
-                    if adapter:
-                        await adapter.send(
-                            source.chat_id,
-                            f"Hi~ I don't recognize you yet!\n\n"
-                            f"Here's your pairing code: `{code}`\n\n"
-                            f"Ask the bot owner to run:\n"
-                            f"`hermes pairing approve {platform_name} {code}`"
-                        )
-                else:
-                    adapter = self.adapters.get(source.platform)
-                    if adapter:
-                        await adapter.send(
-                            source.chat_id,
-                            "Too many pairing requests right now~ "
-                            "Please try again later!"
-                        )
-                    # Record rate limit so subsequent messages are silently ignored
-                    self.pairing_store._record_rate_limit(platform_name, source.user_id)
-            return None
+                return "ไม่มีสิทธิ์ใช้คำสั่งนี้ครับ บัญชีนี้ใช้ได้เฉพาะการถามตอบทั่วไป"
+
+            if not _line_general_allowed and not self._is_user_authorized(source):
+                logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+                # In DMs: offer pairing code. In groups: silently ignore.
+                if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
+                    platform_name = source.platform.value if source.platform else "unknown"
+                    # Rate-limit ALL pairing responses (code or rejection) to
+                    # prevent spamming the user with repeated messages when
+                    # multiple DMs arrive in quick succession.
+                    if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+                        return None
+                    code = self.pairing_store.generate_code(
+                        platform_name, source.user_id, source.user_name or ""
+                    )
+                    if code:
+                        adapter = self.adapters.get(source.platform)
+                        if adapter:
+                            await adapter.send(
+                                source.chat_id,
+                                f"Hi~ I don't recognize you yet!\n\n"
+                                f"Here's your pairing code: `{code}`\n\n"
+                                f"Ask the bot owner to run:\n"
+                                f"`hermes pairing approve {platform_name} {code}`"
+                            )
+                    else:
+                        adapter = self.adapters.get(source.platform)
+                        if adapter:
+                            await adapter.send(
+                                source.chat_id,
+                                "Too many pairing requests right now~ "
+                                "Please try again later!"
+                            )
+                        # Record rate limit so subsequent messages are silently ignored
+                        self.pairing_store._record_rate_limit(platform_name, source.user_id)
+                return None
+
+        # LINE UX: immediately acknowledge normal text messages via push so the
+        # user sees that Hermes received the request while the agent is working.
+        # Slash commands are skipped inside the helper.
+        await self._send_processing_ack_if_needed(event, source)
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -10414,6 +10563,36 @@ class GatewayRunner:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
+    def _resolve_numbered_model_choice(
+        self,
+        event: MessageEvent,
+        model_input: str,
+        explicit_provider: Optional[str],
+    ) -> tuple[str, Optional[str]]:
+        """Resolve `/model 2` style selections cached from the text model list.
+
+        Messaging platforms often show a numbered list first, then the user sends
+        `/model <number>`.  Keep the number out of model_switch and replace it
+        with the cached model/provider pair for this session.
+        """
+        raw = (model_input or "").strip()
+        if not raw.isdigit():
+            return model_input, explicit_provider
+
+        choices = getattr(self, "_model_picker_choices", {}) or {}
+        try:
+            session_key = self._session_key_for_source(event.source)
+        except Exception:
+            return model_input, explicit_provider
+
+        choice = choices.get(session_key, {}).get(raw)
+        if not isinstance(choice, dict):
+            return model_input, explicit_provider
+
+        resolved_model = choice.get("model") or model_input
+        resolved_provider = explicit_provider or choice.get("provider")
+        return resolved_model, resolved_provider
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
 
@@ -10473,6 +10652,25 @@ class GatewayRunner:
         # Check for session override
         source = event.source
         session_key = self._session_key_for_source(source)
+
+        _raw_model_input = model_input
+        model_input, explicit_provider = self._resolve_numbered_model_choice(
+            event,
+            model_input=model_input,
+            explicit_provider=explicit_provider,
+        )
+        _platform_name = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None))
+        if (
+            _platform_name == "line"
+            and _raw_model_input
+            and _raw_model_input.strip().isdigit()
+            and model_input != _raw_model_input
+            and not persist_global
+        ):
+            # LINE has no durable per-chat picker UI; numbered choices are intended
+            # as the user's global default unless a future --session flag is used.
+            persist_global = True
+
         override = self._session_model_overrides.get(session_key, {})
         if override:
             current_model = override.get("model", current_model)
@@ -11976,6 +12174,7 @@ class GatewayRunner:
 
             from hermes_cli.tools_config import _get_platform_tools
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = sorted(self._line_runtime_toolsets_for_source(source, enabled_toolsets))
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -16144,6 +16343,7 @@ class GatewayRunner:
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = sorted(self._line_runtime_toolsets_for_source(source, enabled_toolsets))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
