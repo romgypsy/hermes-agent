@@ -14,6 +14,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -615,6 +616,77 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+_LINE_IMAGE_MARKER_RE = re.compile(r"^\s*LINE_IMAGE_URL:\s*(https://\S+)\s*$", re.IGNORECASE)
+
+
+def _extract_line_image_markers(content: str) -> tuple[list[str], str]:
+    """Extract LINE native-image markers and strip them from user-facing text.
+
+    Some models prepend private reasoning/meta text before the required marker
+    (for example, "Now I have enough data...").  For LINE chart reports the
+    marker is the boundary between non-user-facing setup and the actual report,
+    so when that pattern is detected, discard the pre-marker chatter.
+    """
+    image_urls: list[str] = []
+    text_lines: list[str] = []
+    pre_marker_lines: list[str] = []
+    marker_seen = False
+    for line in str(content or "").splitlines():
+        match = _LINE_IMAGE_MARKER_RE.match(line)
+        if match:
+            image_urls.append(match.group(1).strip())
+            marker_seen = True
+            continue
+        if marker_seen:
+            text_lines.append(line)
+        else:
+            pre_marker_lines.append(line)
+
+    if image_urls and text_lines:
+        pre_text = "\n".join(pre_marker_lines).strip().lower()
+        if any(marker in pre_text for marker in ("now i", "let me", "compile the", "enough data")):
+            return image_urls, "\n".join(text_lines).strip()
+
+    return image_urls, "\n".join([*pre_marker_lines, *text_lines]).strip()
+
+
+def _cap_line_cron_text(content: str, limit: int = 2000) -> str:
+    """Keep LINE cron text concise; images are sent separately via send_image()."""
+    text = str(content or "").strip()
+    if len(text) <= limit:
+        return text
+    suffix = "\n…ตัดข้อความให้ไม่เกิน 2,000 ตัวอักษร"
+    available = max(0, limit - len(suffix))
+    return text[:available].rstrip() + suffix
+
+
+def _send_line_images_via_adapter(adapter, chat_id: str, image_urls: list[str], metadata: Optional[dict], loop, job: dict) -> None:
+    """Send extracted LINE_IMAGE_URL markers as separate LINE image pushes."""
+    if not image_urls:
+        return
+    if not hasattr(adapter, "send_image"):
+        logger.warning("Job '%s': LINE adapter has no send_image(); image marker(s) omitted", job.get("id", "?"))
+        return
+
+    from agent.async_utils import safe_schedule_threadsafe
+
+    image_metadata = dict(metadata or {})
+    image_metadata["line_force_push"] = True
+    for image_url in image_urls:
+        try:
+            future = safe_schedule_threadsafe(
+                adapter.send_image(chat_id, image_url, caption=None, metadata=image_metadata),
+                loop,
+            )
+            if future is None:
+                raise RuntimeError("failed to schedule LINE image send")
+            result = future.result(timeout=60)
+            if result and not getattr(result, "success", True):
+                raise RuntimeError(getattr(result, "error", "unknown"))
+        except Exception as e:
+            logger.warning("Job '%s': failed to send LINE image %s: %s", job.get("id", "?"), image_url, e)
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -647,7 +719,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
+    try:
+        config = load_gateway_config()
+    except Exception as e:
+        msg = f"failed to load gateway config: {e}"
+        logger.error("Job '%s': %s", job["id"], msg)
+        return msg
+
+    # LINE cron reports should be delivered as clean user-facing text, not with
+    # the generic "Cronjob Response" wrapper.  The wrapper also makes market
+    # reports look odd in LINE and can push concise reports over the desired
+    # length budget.
+    wraps_for_any_target = wrap_response
+    if any(str(t.get("platform", "")).lower() == "line" for t in targets):
+        wraps_for_any_target = False
+
+    if wraps_for_any_target:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
         delivery_content = (
@@ -664,13 +751,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from gateway.platforms.base import BasePlatformAdapter
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-
-    try:
-        config = load_gateway_config()
-    except Exception as e:
-        msg = f"failed to load gateway config: {e}"
-        logger.error("Job '%s': %s", job["id"], msg)
-        return msg
 
     delivery_errors = []
 
@@ -715,11 +795,32 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
+        line_image_urls: list[str] = []
+        text_delivery_content = cleaned_delivery_content
+        if platform == Platform.LINE:
+            line_image_urls, text_delivery_content = _extract_line_image_markers(cleaned_delivery_content)
+            is_thai_stock_report = str(job.get("name", "")).startswith("Thai stocks daily trend summary")
+            if is_thai_stock_report:
+                # Thai stock chart-script images remain context-only because a
+                # generic SET chart can be visually out of sync with the daily
+                # analysis.  Allow only deterministic market-snapshot images
+                # generated from a complete LINE_MARKET_SNAPSHOT JSON block in
+                # the agent's final response.
+                line_image_urls = [url for url in line_image_urls if "thai-market-snapshot" in url]
+                try:
+                    from cron.line_market_snapshot import render_snapshot_from_content
+
+                    snapshot_url, text_delivery_content = render_snapshot_from_content(text_delivery_content)
+                    if snapshot_url:
+                        line_image_urls.append(snapshot_url)
+                except Exception as exc:
+                    logger.warning("Job '%s': failed to render Thai market snapshot: %s", job.get("id", "?"), exc)
+            text_delivery_content = _cap_line_cron_text(text_delivery_content, limit=2000)
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = text_delivery_content.strip()
                 adapter_ok = True
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
@@ -756,6 +857,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             logger.warning("Job '%s': %s", job["id"], msg)
                             delivery_errors.append(msg)
 
+                # LINE chart/report marker lines should become a separate native
+                # image message after the summary text, not one combined text bubble.
+                if adapter_ok and platform == Platform.LINE and line_image_urls:
+                    _send_line_images_via_adapter(
+                        runtime_adapter,
+                        chat_id,
+                        line_image_urls,
+                        send_metadata,
+                        loop,
+                        job,
+                    )
+
                 # Send extracted media files as native attachments via the live adapter
                 if adapter_ok and media_files:
                     _send_media_via_adapter(
@@ -779,7 +892,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         if not delivered:
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            if platform == Platform.LINE and line_image_urls:
+                logger.warning(
+                    "Job '%s': LINE_IMAGE_URL marker(s) require live LINE adapter for native image delivery",
+                    job["id"],
+                )
+            coro = _send_to_platform(platform, pconfig, chat_id, text_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -789,7 +907,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # fresh thread that has no running loop.
                 coro.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, text_delivery_content, thread_id=thread_id, media_files=media_files))
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"

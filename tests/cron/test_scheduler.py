@@ -788,6 +788,154 @@ class TestDeliverResultWrapping:
         assert "MEDIA:" not in text_sent
         assert "Report" in text_sent
 
+    def test_live_line_adapter_sends_line_image_marker_as_second_message(self):
+        """LINE_IMAGE_URL markers should be stripped from summary text and sent
+        as a separate native LINE image message via the live adapter."""
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+        adapter.send_image.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.LINE: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(MagicMock(success=True))
+            coro.close()
+            return future
+
+        job = {
+            "id": "btc-line-job",
+            "deliver": "origin",
+            "origin": {"platform": "line", "chat_id": "U123"},
+        }
+        image_url = "https://img.clyfe.online/charts/BTC.png"
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            _deliver_result(
+                job,
+                f"1. สรุปวิเคราะห์\nถือได้ แต่ยังไม่ไล่ซื้อ\nLINE_IMAGE_URL: {image_url}",
+                adapters={Platform.LINE: adapter},
+                loop=loop,
+            )
+
+        adapter.send.assert_called_once()
+        text_sent = adapter.send.call_args[0][1]
+        assert "สรุปวิเคราะห์" in text_sent
+        assert "LINE_IMAGE_URL" not in text_sent
+        assert image_url not in text_sent
+
+        adapter.send_image.assert_called_once()
+        image_call = adapter.send_image.call_args
+        assert image_call[0][0] == "U123"
+        assert image_call[0][1] == image_url
+        assert image_call.kwargs["caption"] is None
+        assert image_call.kwargs["metadata"]["line_force_push"] is True
+
+    def test_line_cron_delivery_skips_wrapper_caps_text_and_suppresses_generic_thai_stock_image(self):
+        """Thai stock LINE cron delivery suppresses generic chart images but keeps text clean."""
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+        adapter.send_image.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.LINE: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(MagicMock(success=True))
+            coro.close()
+            return future
+
+        image_url = "https://img.clyfe.online/charts/SET.png"
+        long_text = "หุ้นไทย Daily 07:00\n" + ("ยาว" * 1200)
+        job = {"id": "thai-line-job", "name": "Thai stocks daily trend summary - @C", "deliver": "line"}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": True}}), \
+             patch("cron.scheduler._resolve_delivery_targets", return_value=[{"platform": "line", "chat_id": "U123"}]), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            _deliver_result(
+                job,
+                f"LINE_IMAGE_URL: {image_url}\n{long_text}",
+                adapters={Platform.LINE: adapter},
+                loop=loop,
+            )
+
+        adapter.send.assert_called_once()
+        text_sent = adapter.send.call_args[0][1]
+        assert len(text_sent) <= 2000
+        assert "Cronjob Response" not in text_sent
+        assert "To stop or manage this job" not in text_sent
+        assert "LINE_IMAGE_URL" not in text_sent
+        assert image_url not in text_sent
+        adapter.send_image.assert_not_called()
+
+    def test_line_cron_delivery_sends_conditional_thai_market_snapshot(self):
+        """Thai stock LINE cron delivery sends deterministic snapshot images when complete JSON is present."""
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+        adapter.send_image.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.LINE: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(MagicMock(success=True))
+            coro.close()
+            return future
+
+        snapshot_url = "https://img.clyfe.online/charts/thai-market-snapshot-123.png"
+        content = (
+            "หุ้นไทย Daily 07:00\nภาพรวม neutral รอจังหวะ\n"
+            'LINE_MARKET_SNAPSHOT: {"set":"1,380-1,395","bias":"NEUTRAL","flow":"USDTHB WATCH",'
+            '"drivers":["MSCI FLOW","BANK EARNINGS"],"sectors":["BANK","ICT"],'
+            '"watch":["KBANK","ADVANC","CPALL"],"risk":"POLICY RISK","tactical":"WAIT FOR DIP"}'
+        )
+        job = {"id": "thai-line-job", "name": "Thai stocks daily trend summary - @C", "deliver": "line"}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": True}}), \
+             patch("cron.scheduler._resolve_delivery_targets", return_value=[{"platform": "line", "chat_id": "U123"}]), \
+             patch("cron.line_market_snapshot.render_snapshot_from_content", return_value=(snapshot_url, "หุ้นไทย Daily 07:00\nภาพรวม neutral รอจังหวะ")), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            _deliver_result(job, content, adapters={Platform.LINE: adapter}, loop=loop)
+
+        adapter.send.assert_called_once()
+        text_sent = adapter.send.call_args[0][1]
+        assert "LINE_MARKET_SNAPSHOT" not in text_sent
+        assert "หุ้นไทย Daily 07:00" in text_sent
+        adapter.send_image.assert_called_once()
+        assert adapter.send_image.call_args[0][1] == snapshot_url
+        assert adapter.send_image.call_args.kwargs["caption"] is None
+
     def test_no_mirror_to_session_call(self):
         """Cron deliveries should NOT mirror into the gateway session."""
         from gateway.config import Platform
