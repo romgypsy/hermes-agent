@@ -185,13 +185,16 @@ def chart_output_dir() -> Path:
     if configured:
         path = Path(configured).expanduser()
     else:
-        path = Path(os.getenv("HERMES_HOME", "~/.hermes")).expanduser() / "public" / "charts"
+        # LINE native images must be reachable as a direct public PNG URL.
+        # The Cloudflare-proxied Hermes dashboard host can return HTML for /charts/*,
+        # so the default uses the dedicated static chart directory served by img.clyfe.online.
+        path = Path("/var/www/hermes/charts")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def chart_public_base_url(configured: Optional[str] = None) -> str:
-    base = configured or os.getenv("LINE_CHART_PUBLIC_BASE_URL") or "https://hermes.clyfe.online/charts"
+    base = configured or os.getenv("LINE_CHART_PUBLIC_BASE_URL") or "https://img.clyfe.online/charts"
     return base.rstrip("/") + "/"
 
 
