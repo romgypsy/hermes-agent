@@ -660,6 +660,16 @@ def _cap_line_cron_text(content: str, limit: int = 2000) -> str:
     return text[:available].rstrip() + suffix
 
 
+def _strip_thai_stock_preamble(content: str) -> str:
+    """Remove model meta notes before the actual Thai stock report heading."""
+    text = str(content or "").strip()
+    heading = "หุ้นไทย Daily 07:00"
+    idx = text.find(heading)
+    if idx > 0:
+        return text[idx:].strip()
+    return text
+
+
 def _send_line_images_via_adapter(adapter, chat_id: str, image_urls: list[str], metadata: Optional[dict], loop, job: dict) -> None:
     """Send extracted LINE_IMAGE_URL markers as separate LINE image pushes."""
     if not image_urls:
@@ -811,6 +821,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     from cron.line_market_snapshot import render_snapshot_from_content
 
                     snapshot_url, text_delivery_content = render_snapshot_from_content(text_delivery_content)
+                    text_delivery_content = _strip_thai_stock_preamble(text_delivery_content)
                     if snapshot_url:
                         line_image_urls.append(snapshot_url)
                 except Exception as exc:

@@ -914,6 +914,8 @@ class TestDeliverResultWrapping:
 
         snapshot_url = "https://img.clyfe.online/charts/thai-market-snapshot-123.png"
         content = (
+            "Now I have comprehensive data. Let me compile the report.\n\n"
+            "**Key data gathered:**\n- SET closed at 1,568\n\n"
             "หุ้นไทย Daily 07:00\nภาพรวม neutral รอจังหวะ\n"
             'LINE_MARKET_SNAPSHOT: {"set":"1,380-1,395","bias":"NEUTRAL","flow":"USDTHB WATCH",'
             '"drivers":["MSCI FLOW","BANK EARNINGS"],"sectors":["BANK","ICT"],'
@@ -931,7 +933,9 @@ class TestDeliverResultWrapping:
         adapter.send.assert_called_once()
         text_sent = adapter.send.call_args[0][1]
         assert "LINE_MARKET_SNAPSHOT" not in text_sent
-        assert "หุ้นไทย Daily 07:00" in text_sent
+        assert text_sent.startswith("หุ้นไทย Daily 07:00")
+        assert "Now I have" not in text_sent
+        assert "Key data gathered" not in text_sent
         adapter.send_image.assert_called_once()
         assert adapter.send_image.call_args[0][1] == snapshot_url
         assert adapter.send_image.call_args.kwargs["caption"] is None
